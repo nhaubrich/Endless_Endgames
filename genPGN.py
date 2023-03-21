@@ -8,7 +8,8 @@
 #place randomly (don't worry about overwriting any)
 #then place two kings randomly (or avoiding check?)
 
-#TODO: increase efficiency. prevent backrank pawns, then smarter king placement. Switch to pychess? Filter out knight and bishop?
+#TODO: Put final positions in stockfish (local?) to weed out inefficient solutions. Or, download 6 piece table and deep search locally. Or try monte carlo approach with API
+#Improve crawl efficiency with /standard/mainline (this+MC?)
 
 
 
@@ -17,7 +18,12 @@ import subprocess
 import time
 import json
 import chess
+import chess.engine
 import pdb
+
+
+engine = chess.engine.SimpleEngine.popen_uci("/usr/games/stockfish")
+limit=chess.engine.Limit(time=20)
 
 def convertToPGN(board):
     #split into rows, then merge contiguous x's
@@ -63,16 +69,22 @@ def throwPiece(board,type_of_piece=None):
     return board[0:position] + type_of_piece + board[position+1:64]
 
 
-def query_tablebase(pgn):
+def query_tablebase(pgn,mainline=False):
+    if mainline:
+        #print("mainline")
+        time.sleep(5)
+    time.sleep(1)
     #print("curl http://tablebase.lichess.ovh/standard?fen="+pgn)
-    
-    gameResultTxtFull=subprocess.Popen(["curl","-s","-w","'%{stderr}%{http_code}%{stdout}'","http://tablebase.lichess.ovh/standard?fen="+pgn],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    if not mainline:
+        gameResultTxtFull=subprocess.Popen(["curl","-s","-w","'%{stderr}%{http_code}%{stdout}'","http://tablebase.lichess.ovh/standard?fen="+pgn],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    else:
+        gameResultTxtFull=subprocess.Popen(["curl","-s","-w","'%{stderr}%{http_code}%{stdout}'","http://tablebase.lichess.ovh/standard/mainline?fen="+pgn],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     gameResultTxt=gameResultTxtFull.stdout.read()
     gameResultErr=gameResultTxtFull.stderr.read()
     if gameResultErr==b"429": 
         print(gameResultErr,gameResultTxt)
         time.sleep(60)
-        gameResult=None
+        gameResult=query_tablebase(pgn,mainline=False)
     elif gameResultErr!=b"200":
         print(gameResultErr,gameResultTxt)
         gameResult=None
@@ -88,8 +100,7 @@ while True:
     while validPosition!=True:
         #print("try")
         pgn = genPGN()
-        #pgn = "3q4/8/2b5/1K5k/P7/7n/8/8_w_-_-_0_1"
-        #pgn = "3kN3/8/4B3/8/K7/4B3/2p5/8_b_-_-_0_1"
+        #pgn = "2q2q2/8/2k5/Q7/2b5/8/8/1K6_b_-_-_0_1"
         boardState=chess.Board(pgn.replace("_"," "))
         validPosition=boardState.is_valid()
 
@@ -114,26 +125,32 @@ while True:
         if result=="win":
 
             if gameResult['dtm']==None:
-                #crawl through dtz until dtm is known
-                crawlGameResult = gameResult
-                n=0
-                while crawlGameResult['dtm']==None and not crawlGameResult['checkmate']: #break if checkmate or dtm!=none
-                    time.sleep(0.5)
-                    boardState.push(chess.Move.from_uci(crawlGameResult['moves'][0]['uci']))
-                    crawlPGN = boardState.fen().replace(" ","_")
-
-                    crawlGameResult = query_tablebase(crawlPGN)
-                    #print(crawlGameResult)
-                    n+=1
-        
+                lowest_dtm=9999
+                #check a few mainlines and use lowest result
+                for i,move in enumerate(gameResult['moves']):
+                    if move['category']=='loss' and i<5: #i.e. move results in their loss. Limit to 5 for sake of server
+                        
+                        
+                        variationBoard = boardState.copy()
+                        variationBoard.push(chess.Move.from_uci(move['uci']))
+                        varPGN = variationBoard.fen().replace(" ","_")
+                        
+                        info = engine.analyse(variationBoard, limit)
+                        
+                        if info['score'].is_mate() and 'pv' in info:
+                            dtm = len(info['pv'])
+                            #print("stockfish {}".format(dtm))
+                        
+                        else:
+                            varResult = query_tablebase(varPGN,mainline=True)
+                            dtm = len(varResult['mainline'])
+                            print(move['san'],dtm)
+                        lowest_dtm = min(dtm,lowest_dtm)
+                        if lowest_dtm<50:
+                            break
+                
                 #pdb.set_trace()
-                if crawlGameResult['dtm']==None:
-                    dtm = boardState.fullmove_number*2
-                else:
-
-                    dtm = boardState.fullmove_number*2+abs(crawlGameResult['dtm'])
-                #print("Crawled {}, dtm:{}".format(n,dtm) )
-                gameResult["dtm"] = dtm
+                gameResult["dtm"] = lowest_dtm
 
             if gameResult['dtm']!=None and gameResult['dtm']>=50:
                 print("MOVES {}".format(gameResult['dtm']),pgn)
@@ -149,8 +166,6 @@ while True:
                     pngCommand[4]="KQ"
                     print(" ".join(pngCommand))
                     subprocess.Popen(pngCommand)
-
-
 
 
             #if result in ['cursed-win','blessed-loss']:
